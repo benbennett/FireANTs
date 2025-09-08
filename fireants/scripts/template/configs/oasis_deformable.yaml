@@ -15,11 +15,12 @@ template_iterations: 6
 # laplacian params
 num_laplacian: 2
 laplace_params:
-  learning_rate: 0.5
+  learning_rate: 0.25
   itk_scale: true
+  clamp_min: null
 
 # shape averaging
-shape_avg: true
+shape_avg: false
 
 # save outputs
 save_dir: ./saved_templates
@@ -61,7 +62,7 @@ affine:
 do_deform: True
 deform_algo: greedy
 deform:
-  iterations: [200, 100, 50]
+  iterations: [200, 100, 20]
   scales: [4, 2, 1]
   optimizer_lr: 0.25        # for template creation, use lower learning rate than pairwise
   smooth_warp_sigma: 0.5

@@ -32,7 +32,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.nn import functional as F
 
-from fireants.io.image import Image, BatchedImages
+from fireants.io.image import Image, BatchedImages, FakeBatchedImages
 from fireants.registration import RigidRegistration, AffineRegistration, GreedyRegistration, SyNRegistration, MomentsRegistration
 from fireants.scripts.template.template_helpers import *
 from fireants.utils.imageutils import LaplacianFilter
@@ -152,7 +152,10 @@ def main(args):
 
     # save initial template if specified
     if args.save_init_template and local_rank == 0:
-        torch.save(init_template.array.cpu(), f"{args.save_dir}/init_template.pt")
+        init_template_fake_batch = FakeBatchedImages(init_template.array, BatchedImages([init_template]))
+        init_template_fake_batch.write_image(f"{args.save_dir}/init_template.nii.gz")
+        logger.info(f"Saved initial template to {args.save_dir}/init_template.nii.gz")
+        # torch.save(init_template.array.cpu(), f"{args.save_dir}/init_template.pt")
 
     logger.debug((init_template.shape, init_template.array.min(), init_template.array.max()))
 
@@ -165,6 +168,7 @@ def main(args):
         # load up batches
         imgbatches = [image_files[i:i+batch_size] for i in range(0, len(image_files), batch_size)]
         imgidbatches = [image_identifiers[i:i+batch_size] for i in range(0, len(image_identifiers), batch_size)]
+        logger.info(f"Process {local_rank} has {len(imgbatches)} batches.")
 
         # load up any additional files for last epoch
         additional_save_batches = []
@@ -182,6 +186,7 @@ def main(args):
 
         # if shape averaging is true, we need to keep track of warp statistics as well
         if args.shape_avg:
+            raise NotImplementedError("Shape averaging is buggy, fix coming up in new release.")
             B, C, H, W, D = init_template.array.shape
             avg_warp = torch.zeros((1, H, W, D, 3), device=device)
         else:
@@ -277,31 +282,37 @@ def main(args):
         
         # update template
         dist.all_reduce(updated_template_arr, op=dist.ReduceOp.SUM)
-        
+
         # perform shape averaging if specified
         if avg_warp is not None:
             avg_warp = avg_warp / total_file_count
             dist.all_reduce(avg_warp, op=dist.ReduceOp.SUM)
             # now we have added all the average grid coordinates, take inverse
             init_template_batch.broadcast(1)
-            inverse_avg_warp = shape_averaging_invwarp(init_template_batch, avg_warp)
+            inverse_avg_warp = shape_averaging_invwarp(init_template_batch, avg_warp)  # this is warp
             updated_template_arr = laplace(updated_template_arr, itk_scale=True, learning_rate=1)
             updated_template_arr = F.grid_sample(updated_template_arr, inverse_avg_warp, align_corners=True)
 
         # apply laplacian filter
         for _ in range(args.num_laplacian):
             updated_template_arr = laplace(updated_template_arr)
+        
+        # detach the template array
+        updated_template_arr = updated_template_arr.detach()
 
         logger.debug("Template updated...")
-        logger.debug((local_rank, init_template.array.min(), init_template.array.mean(), init_template.array.max()))
-        logger.debug((local_rank, updated_template_arr.min(), updated_template_arr.mean(), updated_template_arr.max()))
+        logger.debug(f"Before shape averaging: ({local_rank}, {init_template.array.min()}, {init_template.array.mean()}, {init_template.array.max()})")
+        logger.debug(f"After shape averaging: ({local_rank}, {updated_template_arr.min()}, {updated_template_arr.mean()}, {updated_template_arr.max()})")
 
         # update the template array to new template
-        init_template.array = updated_template_arr + 0
+        init_template.array = updated_template_arr
 
         # save here
         if ((epoch % args.save_every == 0) or is_last_epoch) and local_rank == 0:
-            torch.save(updated_template_arr, f"{args.save_dir}/template_{epoch}.pt")
+            init_template_fake_batch = FakeBatchedImages(updated_template_arr, BatchedImages([init_template]))
+            init_template_fake_batch.write_image(f"{args.save_dir}/template_{epoch}.nii.gz")
+            logger.info(f"Saved template to {args.save_dir}/template_{epoch}.nii.gz")
+            # torch.save(updated_template_arr, f"{args.save_dir}/template_{epoch}.pt")
 
     # cleanup
     dist_cleanup(world_size)

@@ -121,7 +121,7 @@ def downsample(image: ItemOrList[torch.Tensor], size: List[int], mode: str, sigm
         # create gaussian convs
         gaussians = [gaussian_1d(s, truncated=2) for s in sigma]
     # otherwise gaussians is given, just downsample
-    image_smooth = separable_filtering(image+0, gaussians)
+    image_smooth = separable_filtering(image.clone(), gaussians)
     image_down = F.interpolate(image_smooth, size=size, mode=mode, align_corners=True)
     return image_down
 
@@ -301,11 +301,12 @@ def compute_inverse_warp_exp(warp, grid, lr=5e-3, iters=200, n=10):
 
 ### Other itk like filters
 class LaplacianFilter(nn.Module):
-    def __init__(self, dims, device=None, spacing=None, itk_scale=True, learning_rate=1):
+    def __init__(self, dims, device=None, spacing=None, itk_scale=True, learning_rate=1, clamp_min=None):
         super().__init__()
         self.dims = dims
         self.itk_scale = itk_scale
         self.learning_rate = learning_rate
+        self.clamp_min = clamp_min
         assert dims in [2, 3] 
         if spacing is None:
             spacing = [1.0] * dims
@@ -361,8 +362,14 @@ class LaplacianFilter(nn.Module):
             lap_image = (lap_image - lap_meta['min']) / (lap_meta['max'] - lap_meta['min']) * (image_meta['max'] - image_meta['min']) 
             scaled_image = image - learning_rate * lap_image
             # scale it again
+            if self.clamp_min is not None:
+                scaled_image = torch.clamp(scaled_image, min=self.clamp_min)
+            # scale it now
             scaled_meta = self._scale_image(scaled_image)
             scaled_image = scaled_image - scaled_meta['min']
             return scaled_image
         else:
-            return image - learning_rate * lap_image
+            ret = image - learning_rate * lap_image
+            if self.clamp_min is not None:
+                ret = torch.clamp(ret, min=self.clamp_min)
+            return ret
