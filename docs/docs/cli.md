@@ -6,6 +6,14 @@ FireANTs provides command-line interface (CLI) tools that offer ANTs-compatible 
 
 The FireANTs CLI tools aim to provide a familiar interface for users coming from ANTs while leveraging GPU acceleration and the modern PyTorch backend of FireANTs. These tools maintain compatibility with ANTs workflows, making it easy to transition existing scripts and pipelines.
 
+### Installing the CLI entry points
+
+When you install the package (e.g., `pip install .` from the repository root or `pip install fireants` from PyPI once published), the `fireantsRegistration` executable is added to your `PATH` automatically via the package’s console scripts. After installation you can run:
+
+```bash
+fireantsRegistration --help
+```
+
 ## Available Tools
 
 ### `fireantsRegistration`
@@ -249,4 +257,3 @@ For more information on the underlying registration methods, see:
 - [Rigid and Affine Registration](advanced/rigidaffine.md)
 - [Deformable Registration](advanced/deformable.md)
 - [Custom Loss Functions](customloss.md)
-
