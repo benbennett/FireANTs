@@ -20,6 +20,23 @@ import os
 
 include_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'include')
 
+class BuildExtensionWithFlags(cpp_extension.BuildExtension):
+    def build_extensions(self):
+        if getattr(self, 'debug', False):
+            common_cxx_flags = ['-O0', '-g']
+            common_nvcc_flags = ['-O0', '-G', '-g', '-lineinfo']
+        else:
+            common_cxx_flags = ['-O3']
+            common_nvcc_flags = ['-O3']
+
+        for ext in self.extensions:
+            ext.extra_compile_args = {
+                'cxx': common_cxx_flags,
+                'nvcc': common_nvcc_flags,
+            }
+
+        super().build_extensions()
+
 setup(
     name='fireants_fused_ops',
     version='1.0.0',
@@ -40,15 +57,9 @@ setup(
             ],
             include_dirs=[include_dir] + torch.utils.cpp_extension.include_paths(),
             library_dirs=torch.utils.cpp_extension.library_paths(),
-            extra_compile_args={
-                 'nvcc': ['-lineinfo'],
-            }
-            #extra_compile_args={
-                #'cxx': ['-O3'],
-                #'nvcc': ['-O3']
-            #}
+            extra_compile_args={}
         )
     ],
-    cmdclass={'build_ext': cpp_extension.BuildExtension},
+    cmdclass={'build_ext': BuildExtensionWithFlags},
     install_requires=['torch>=2.3.0'],
 )
