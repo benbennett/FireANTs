@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
 # 
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
@@ -49,6 +49,7 @@ setup(
                 'src/src.cpp',
                 'src/CrossCorrelation.cu',  
                 'src/FusedGridSampler.cu',
+                'src/FusedGridSamplerGenericLabel.cu',
                 'src/FusedGridComposer.cu',
                 'src/FusedGenerateGrid.cu',
                 'src/AdamUtils.cu',

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
 # 
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
@@ -77,7 +77,7 @@ class SyNRegistration(AbstractRegistration, DeformableMixin):
         affine (torch.Tensor): Initial affine transformation matrix
         smooth_warp_sigma (float): Smoothing sigma for warp field
     """
-    def __init__(self, scales: List[int], iterations: List[float], 
+    def __init__(self, scales: List[float], iterations: List[int], 
                 fixed_images: BatchedImages, moving_images: BatchedImages,
                 loss_type: str = "cc",
                 deformation_type: str = 'compositive',
@@ -192,7 +192,7 @@ class SyNRegistration(AbstractRegistration, DeformableMixin):
             ).permute(*self.fwd_warp.permute_imgtov)
 
         # compute inverse of rev_warp with the size of `fixed_images`
-        rev_inv_warp_field = compositive_warp_inverse(fixed_images, self.rev_warp.get_warp(), displacement=True)
+        rev_inv_warp_field = compositive_warp_inverse(fixed_images, self.rev_warp.get_warp(), displacement=True, scales=self.scales, iterations=self.iterations)
         if tuple(rev_inv_warp_field.shape[1:-1]) != tuple(shape[2:]):
             rev_inv_warp_field = F.interpolate(
                 self.rev_warp.get_warp().permute(*self.rev_warp.permute_vtoimg),
@@ -253,15 +253,30 @@ class SyNRegistration(AbstractRegistration, DeformableMixin):
         # multi-scale optimization
         for scale, iters in zip(self.scales, self.iterations):
             self.convergence_monitor.reset()
+            # notify loss function of scale change if it supports it
+            if hasattr(self.loss_fn, 'set_current_scale_and_iterations'):
+                self.loss_fn.set_current_scale_and_iterations(scale, iters)
             # resize images 
             size_down = [max(int(s / scale), MIN_IMG_SIZE) for s in fixed_size]
             if self.blur and scale > 1:
-                sigmas = 0.5 * torch.tensor([sz/szdown for sz, szdown in zip(fixed_size, size_down)], device=fixed_arrays.device, dtype=fixed_arrays.dtype)
+                sigmas = 0.5 * torch.tensor(
+                    [sz / szdown for sz, szdown in zip(fixed_size, size_down)],
+                    device=fixed_arrays.device,
+                    dtype=fixed_arrays.dtype,
+                )
                 gaussians = [gaussian_1d(s, truncated=2) for s in sigmas]
-                fixed_image_down = downsample(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, gaussians=gaussians)
-                moving_image_blur = separable_filtering(moving_arrays, gaussians)
+                fixed_image_down = self._downsample_image_and_mask(
+                    fixed_arrays,
+                    size=size_down,
+                    mode=self.fixed_images.interpolate_mode,
+                    gaussians=gaussians,
+                    align_corners=True,
+                )
+                moving_image_blur = self._smooth_image_not_mask(moving_arrays, gaussians)
             else:
-                fixed_image_down = F.interpolate(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True)
+                fixed_image_down = F.interpolate(
+                    fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True
+                )
                 moving_image_blur = moving_arrays
 
             #### Set size for warp field
@@ -307,8 +322,8 @@ class SyNRegistration(AbstractRegistration, DeformableMixin):
                 if self.progress_bar:
                     pbar.set_description("scale: {}, iter: {}/{}, loss: {:4f}".format(scale, i, iters, loss.item()/scale_factor))
                 # optimize the deformations
-                self.fwd_warp.step()
-                self.rev_warp.step()
+                self.fwd_warp.step(loss)
+                self.rev_warp.step(loss)
                 if self.convergence_monitor.converged(loss.item()):
                     break
 

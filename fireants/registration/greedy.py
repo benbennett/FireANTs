@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
 #
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
@@ -83,7 +83,7 @@ class GreedyRegistration(AbstractRegistration, DeformableMixin):
         smooth_warp_sigma (float): Smoothing sigma for warp field
 
     """
-    def __init__(self, scales: List[int], iterations: List[float],
+    def __init__(self, scales: List[float], iterations: List[int],
                 fixed_images: BatchedImages, moving_images: BatchedImages,
                 loss_type: str = "cc",
                 deformation_type: str = 'compositive',
@@ -168,7 +168,7 @@ class GreedyRegistration(AbstractRegistration, DeformableMixin):
             shape = [moving_arrays.shape[0], 1] + list(shape) if use_moving_shape else [fixed_arrays.shape[0], 1] + list(shape)
 
         warp = self.warp.get_warp().detach().clone()
-        warp_inv = compositive_warp_inverse(moving_images if use_moving_shape else fixed_images, warp, displacement=True)
+        warp_inv = compositive_warp_inverse(moving_images if use_moving_shape else fixed_images, warp, scales=self.scales, iterations=self.iterations, displacement=True)
         # resample if needed
         mode = "bilinear" if self.dims == 2 else "trilinear"
         if tuple(warp_inv.shape[1:-1]) != tuple(shape[2:]):
@@ -277,18 +277,41 @@ class GreedyRegistration(AbstractRegistration, DeformableMixin):
         # multi-scale optimization
         for scale, iters in zip(self.scales, self.iterations):
             self.convergence_monitor.reset()
+            # notify loss function of scale change if it supports it
+            if hasattr(self.loss_fn, 'set_current_scale_and_iterations'):
+                self.loss_fn.set_current_scale_and_iterations(scale, iters)
             # resize images
             size_down = [max(int(s / scale), MIN_IMG_SIZE) for s in fixed_size]
             moving_size_down = [max(int(s / scale), MIN_IMG_SIZE) for s in moving_size]
             if self.blur and scale > 1:
-                sigmas = 0.5 * torch.tensor([sz/szdown for sz, szdown in zip(fixed_size, size_down)], device=fixed_arrays.device, dtype=fixed_arrays.dtype)
+                sigmas = 0.5 * torch.tensor(
+                    [sz / szdown for sz, szdown in zip(fixed_size, size_down)],
+                    device=fixed_arrays.device,
+                    dtype=fixed_arrays.dtype,
+                )
                 gaussians = [gaussian_1d(s, truncated=2) for s in sigmas]
-                fixed_image_down = downsample(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, gaussians=gaussians)
-                moving_image_blur = downsample(moving_arrays, size=moving_size_down, mode=self.moving_images.interpolate_mode, gaussians=gaussians)
+                fixed_image_down = self._downsample_image_and_mask(
+                    fixed_arrays,
+                    size=size_down,
+                    mode=self.fixed_images.interpolate_mode,
+                    gaussians=gaussians,
+                    align_corners=True,
+                )
+                moving_image_blur = self._downsample_image_and_mask(
+                    moving_arrays,
+                    size=moving_size_down,
+                    mode=self.moving_images.interpolate_mode,
+                    gaussians=gaussians,
+                    align_corners=True,
+                )
             else:
                 if scale > 1:
-                    fixed_image_down = F.interpolate(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True)
-                    moving_image_blur = F.interpolate(moving_arrays, size=moving_size_down, mode=self.moving_images.interpolate_mode, align_corners=True)
+                    fixed_image_down = F.interpolate(
+                        fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True
+                    )
+                    moving_image_blur = F.interpolate(
+                        moving_arrays, size=moving_size_down, mode=self.moving_images.interpolate_mode, align_corners=True
+                    )
                 else:
                     fixed_image_down = fixed_arrays
                     moving_image_blur = moving_arrays
@@ -324,7 +347,7 @@ class GreedyRegistration(AbstractRegistration, DeformableMixin):
                 if self.progress_bar:
                     pbar.set_description("scale: {}, iter: {}/{}, loss: {:4f}".format(scale, i, iters, loss.item()/scale_factor))
                 # optimize the velocity field
-                self.warp.step()
+                self.warp.step(loss)
                 # check for convergence
                 if self.convergence_monitor.converged(loss.item()):
                     break

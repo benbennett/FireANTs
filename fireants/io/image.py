@@ -1,5 +1,5 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
-# 
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
+#
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
 # in the LICENSE file at the root of this repository.
@@ -7,11 +7,10 @@
 # IMPORTANT: This code is part of FireANTs and its use, reproduction, or
 # distribution must comply with the full license terms, including:
 # - Maintaining all copyright notices and bibliography references
-# - Using only approved (re)-distribution channels 
+# - Using only approved (re)-distribution channels
 # - Proper attribution in derivative works
 #
-# For full license details, see: https://github.com/rohitrango/FireANTs/blob/main/LICENSE 
-
+# For full license details, see: https://github.com/rohitrango/FireANTs/blob/main/LICENSE
 
 '''
 This module provides classes for handling medical images with SimpleITK backend and PyTorch tensor support.
@@ -24,13 +23,14 @@ import numpy as np
 from typing import Any, Union, List, Tuple
 from time import time
 from fireants.types import devicetype
-from fireants.utils.imageutils import integer_to_onehot
+from fireants.utils.imageutils import integer_to_onehot, winsorize_image
 from fireants.utils.util import check_and_raise_cond, augment_filenames
 import logging
 from copy import deepcopy
 import os
 import hashlib
 from fireants.utils.globals import PERMITTED_ANTS_WARP_EXT
+from fireants.interpolator import fireants_interpolator as fi
 # logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -62,7 +62,7 @@ def get_lock():
 def divide_size_into_chunks(size: int, gp_size: int) -> list:
     '''
     Divide a size into as-equal-as-possible chunks based on world size for distributed
-    
+
     Args:
         size (int): The total size to be divided
         gp_size (int): Number of processes to divide the size across
@@ -73,7 +73,7 @@ def divide_size_into_chunks(size: int, gp_size: int) -> list:
     base_size = size // gp_size
     remainder = size % gp_size
     chunks = [base_size] * gp_size
-    
+
     # Distribute remainder across first 'remainder' processes
     for i in range(remainder):
         chunks[i] += 1
@@ -95,7 +95,8 @@ class Image:
             See `max_seg_label`, `background_seg_label`, `seg_preprocessor` for more details on how to manipulate integer label images.
         max_seg_label (int, optional): Maximum label value for segmentation. Values above this are set to background_seg_label.
             Set to None by default, meaning no label clipping is done.
-        background_seg_label (int, optional): Label value representing background in segmentations. Defaults to 0.
+        background_seg_label (int, optional): Label value representing background in segmentations. Defaults to -1 (background is included as a one-hot label)
+        is_onehot (bool, optional): If True, use one-hot interpolation (bilinear/trilinear on one-hot channels). If False and FFO is available, use generic-label fused sampler. Defaults to False. When FFO is not available, this is forced to True.
         seg_preprocessor (callable, optional): Function to preprocess segmentation arrays. Defaults to identity function.
         orientation (str, optional): Reorient the image to this orientation. Defaults to None.
         spacing (array-like, optional): Custom spacing for the image. If None, uses SimpleITK values.
@@ -113,12 +114,14 @@ class Image:
         phy2torch (torch.Tensor): Transform matrix from physical to normalized coordinates
         device (devicetype): Device where PyTorch tensors are stored
     '''
-    def __init__(self, itk_image: sitk.SimpleITK.Image, 
-                 device: devicetype = 'cuda', 
+    def __init__(self, itk_image: sitk.SimpleITK.Image,
+                 device: devicetype = 'cuda',
                  dtype: torch.dtype = None,
-                 is_segmentation=False, max_seg_label=None, 
-                 background_seg_label=0, seg_preprocessor=lambda x: x,
+                 is_segmentation=False, max_seg_label=None,
+                 background_seg_label=-1, is_onehot: bool = False, seg_preprocessor=lambda x: x,
                  orientation: str = None,
+                 winsorize: bool = False,
+                 winsorize_percentile: Tuple[float, float] = (1.0, 99.0),
                 spacing=None, direction=None, origin=None, center=None) -> None:
 
         if orientation is not None:
@@ -130,8 +133,12 @@ class Image:
         # check for segmentation parameters
         # if `is_segmentation` is False, then just treat this as an image with given dtype
         if not is_segmentation:
-            self.array = torch.from_numpy(sitk.GetArrayFromImage(itk_image).astype(float)).to(device, dtype)
-            # self.array = self.array[None, None]   # TODO: Change it to support multichannel images, right now just batchify and add a dummy channel to it
+            self.interpolation_mode = None
+            self.is_onehot = False
+            itk_img = sitk.GetArrayFromImage(itk_image).astype(float)
+            if winsorize:
+                itk_img = winsorize_image(itk_img, winsorize_percentile[0], winsorize_percentile[1])
+            self.array = torch.from_numpy(itk_img).to(device, dtype)
             channels = itk_image.GetNumberOfComponentsPerPixel()
             self.channels = channels
             # assert channels == 1, "Only single channel images supported"
@@ -145,20 +152,30 @@ class Image:
             # add batch dimension
             self.array.unsqueeze_(0)
         else:
-            array = torch.from_numpy(sitk.GetArrayFromImage(itk_image).astype(int)).to(device).long()
+            # When FFO is not available, force one-hot mode so generic-label path is never used
+            if not fi.use_ffo:
+                is_onehot = True
+            self.is_onehot = is_onehot
+            array = torch.from_numpy(sitk.GetArrayFromImage(itk_image).astype(int)).float().to(device)
             # preprocess segmentation if provided by user
             array = seg_preprocessor(array)
             if max_seg_label is not None:
-                array[array > max_seg_label] = background_seg_label
-            array = integer_to_onehot(array, background_label=background_seg_label, max_label=max_seg_label, dtype=dtype)[None]  # [1, C, H, W, D]
+                array[array > max_seg_label] = background_seg_label if is_onehot else array.min()
+            # convert to one-hot encoding
+            if is_onehot:
+                array = integer_to_onehot(array.long(), background_label=background_seg_label, max_label=max_seg_label, dtype=dtype)[None]  # [1, C, H, W, D]
+            else:
+                array = array[None, None]  # [1, 1, H, W, D]
+            # set these values
             self.array = array
             self.channels = array.shape[1]
+            self.interpolation_mode = 'genericlabel' if (not is_onehot) else None
         # initialize matrix for pixel to physical
         dims = itk_image.GetDimension()
         self.dims = dims
         if dims not in [2, 3]:
             raise NotImplementedError("Image class only supports 2D/3D images.")
-        
+
         # custom spacing if not provided use simpleitk values
         spacing = np.array(itk_image.GetSpacing())[None] if spacing is None else np.array(spacing)[None]
         origin = np.array(itk_image.GetOrigin())[None] if origin is None else np.array(origin)[None]
@@ -170,7 +187,7 @@ class Image:
         px2phy = np.eye(dims+1)
         px2phy[:dims, -1] = origin
         px2phy[:dims, :dims] = direction
-        px2phy[:dims, :dims] = px2phy[:dims, :dims] * spacing 
+        px2phy[:dims, :dims] = px2phy[:dims, :dims] * spacing
         # generate mapping from torch to px
         torch2px = np.eye(dims+1)
         scaleterm = (np.array(itk_image.GetSize())-1)*0.5
@@ -182,8 +199,15 @@ class Image:
         # also save intermediates just in case (as numpy arrays)
         self._torch2px = torch2px
         self._px2phy = px2phy
+        # keep these as well
+        self.torch2px = torch.from_numpy(self._torch2px).to(device).float().unsqueeze_(0)
+        self.px2torch = torch.inverse(self.torch2px[0]).float().unsqueeze_(0)
+        self.px2phy = torch.from_numpy(self._px2phy).to(device).float().unsqueeze_(0)
+        self.phy2px = torch.inverse(self.px2phy[0]).float().unsqueeze_(0)
+
+        self._px2phy = px2phy
         self.device = device
-        
+
     @classmethod
     def load_file(cls, image_path:str, *args: Any, **kwargs: Any) -> 'Image':
         '''Load an image from a file.
@@ -198,7 +222,7 @@ class Image:
         '''
         itk_image = sitk.ReadImage(image_path)
         return cls(itk_image, *args, **kwargs)
-    
+
     @property
     def shape(self) -> Union[torch.Size, List, Tuple]:
         '''Get the shape of the image.
@@ -207,7 +231,7 @@ class Image:
             torch.Size: Shape of the image
         '''
         return self.array.shape
-    
+
     @property
     def is_array_present(self) -> bool:
         '''Check if the PyTorch tensor representation of the image is present.
@@ -225,10 +249,14 @@ class Image:
         '''
         if self.is_array_present:
             del self.array
-    
+
+    def concat(self, *others, optimize_memory: bool = True):
+        ''' alias for concatenate '''
+        return self.concatenate(*others, optimize_memory=optimize_memory)
+
     def concatenate(self, *others, optimize_memory: bool = True):
-        ''' 
-        others is a list of Images or list of lists (in which case the user accidentally passed a list of images) 
+        '''
+        others is a list of Images or list of lists (in which case the user accidentally passed a list of images)
 
             optimize_memory: if True, delete the arrays of the other images after concatenation
 
@@ -262,7 +290,7 @@ class Image:
             for other in others:
                 other.delete_array()
         return self
-    
+
     def to(self, device_or_dtype: Union[devicetype, torch.dtype]):
         '''
         Move the image to a different device or change its dtype.
@@ -288,6 +316,10 @@ class Image:
         del self.phy2torch
         del self._torch2px
         del self._px2phy
+        del self.torch2px
+        del self.px2torch
+        del self.px2phy
+        del self.phy2px
 
 def concat(*images, optimize_memory: bool = True):
     ''' Creates a copy of the images and concatenates them along the channel dimension
@@ -325,6 +357,7 @@ class BatchedImages:
         if isinstance(images, Image):
             images = [images]
         self.images = images
+
         if len(self.images) == 0:
             raise ValueError("BatchedImages must have at least one image")
         # check if all images have a PyTorch tensor representation
@@ -337,7 +370,12 @@ class BatchedImages:
 
         # set the number of images
         self.n_images = len(self.images)
-        self.interpolate_mode = 'bilinear' if len(self.images[0].shape) == 4 else 'trilinear'
+        # derive the interpolation mode from the first image if it is present, otherwise use bilinear/trilinear
+        first_interp = getattr(self.images[0], 'interpolation_mode', None)
+        if first_interp is not None:
+            self.interpolate_mode = first_interp
+        else:
+            self.interpolate_mode = 'bilinear' if len(self.images[0].shape) == 4 else 'trilinear'
         self.broadcasted = False
         # create a batch tensor
         self.batch_tensor = torch.cat([x.array for x in self.images], dim=0) if self.n_images > 1 else self.images[0].array
@@ -349,15 +387,23 @@ class BatchedImages:
         # create metadata
         self.torch2phy = torch.cat([x.torch2phy for x in self.images], dim=0)
         self.phy2torch = torch.cat([x.phy2torch for x in self.images], dim=0)
-        # sharding info 
+        self.torch2px = torch.cat([x.torch2px for x in self.images], dim=0)
+        self.px2torch = torch.cat([x.px2torch for x in self.images], dim=0)
+        self.px2phy = torch.cat([x.px2phy for x in self.images], dim=0)
+        self.phy2px = torch.cat([x.phy2px for x in self.images], dim=0)
+        # sharding info
         self.is_sharded = False
-    
+
     def set_device(self, device_name):
         # set the device for the batch tensor
         self.batch_tensor = self.batch_tensor.to(device_name)
         self.torch2phy = self.torch2phy.to(device_name)
         self.phy2torch = self.phy2torch.to(device_name)
-    
+        self.torch2px = self.torch2px.to(device_name)
+        self.px2torch = self.px2torch.to(device_name)
+        self.px2phy = self.px2phy.to(device_name)
+        self.phy2px = self.phy2px.to(device_name)
+
     def to(self, device_or_dtype: Union[devicetype, torch.dtype]):
         '''
         Move the batch to a different device or change its dtype.
@@ -376,7 +422,7 @@ class BatchedImages:
         size = self.batch_tensor.shape[dim_to_shard+2]
         chunk_sizes = divide_size_into_chunks(size, gp_size)
         local_rank = gp_group.index(rank)
-        # check 
+        # check
         start = sum(chunk_sizes[:local_rank])
         end = sum(chunk_sizes[:local_rank+1])
         # store the full tensor into batch_tensor_full, and sharded version in unshareded
@@ -387,7 +433,7 @@ class BatchedImages:
         self._shard_end = end
         self._dim_to_shard = dim_to_shard
         self.is_sharded = True
-    
+
     def _save_shards(self, dim_to_shard):
         gp_group = parallel_state.get_parallel_state().get_current_gp_group()
         gp_size = len(gp_group)
@@ -412,21 +458,21 @@ class BatchedImages:
             return self.batch_tensor
 
     def get_interpolator_type(self):
-        ''' 
-        get the interpolator type to be used in `fireants_interpolator` 
+        '''
+        get the interpolator type to be used in `fireants_interpolator`
 
         - since the grid sampler only accepts only bilinear / nearest, we need to return 'bilinear' for bilinear/trilinear
         '''
         if self.interpolate_mode in ['bilinear', 'trilinear']:
             return 'bilinear'
         return self.interpolate_mode
-    
+
     def broadcast(self, n):
         '''Broadcast the batch to n channels.
 
         Args:
             n (int): Number of channels to broadcast to
-        
+
         Raises:
             ValueError: If batch size is not 1
         '''
@@ -434,27 +480,27 @@ class BatchedImages:
             raise ValueError("Batch size must be 1 to broadcast")
         self.broadcasted = True
         self.n_images = n
-    
+
     def __del__(self):
         '''Delete all Image objects in the batch.'''
         del self.batch_tensor
         del self.torch2phy
         del self.phy2torch
-    
+
     @property
     def device(self):
         '''Get the device where the image tensors are stored.'''
         return self.batch_tensor.device
-    
+
     @property
     def dims(self):
         '''Get the dimensionality of the images.'''
         return self.images[0].dims
-    
+
     def size(self):
         '''Get the number of images in the batch.'''
         return self.n_images
-    
+
     @property
     def shape(self):
         '''Get the shape of the images.'''
@@ -462,15 +508,15 @@ class BatchedImages:
         shape = list(self.batch_tensor.shape)
         shape[0] = self.n_images
         return shape
-    
+
     def get_torch2phy(self):
         return self.torch2phy
-    
+
     def get_phy2torch(self):
         return self.phy2torch
 
 class FakeBatchedImages:
-    '''     
+    '''
     A class to handle fake batches of images.
     This is used to handle the case where the user passes a tensor to the registration class
     instead of a BatchedImages object.
@@ -493,76 +539,76 @@ class FakeBatchedImages:
         self.batched_images = batched_images
         self.interpolate_mode = batched_images.interpolate_mode
         self.is_sharded = batched_images.is_sharded
-    
+
     def get_interpolator_type(self):
-        ''' 
-        get the interpolator type to be used in `fireants_interpolator` 
+        '''
+        get the interpolator type to be used in `fireants_interpolator`
 
         - since the grid sampler only accepts only bilinear / nearest, we need to return 'bilinear' for bilinear/trilinear
         '''
         if self.interpolate_mode in ['bilinear', 'trilinear']:
             return 'bilinear'
         return self.interpolate_mode
-    
+
     def __call__(self):
         return self.tensor
-    
+
     def get_torch2phy(self):
         return self.batched_images.torch2phy
-    
+
     def get_phy2torch(self):
         return self.batched_images.phy2torch
-    
+
     def size(self):
         return self.tensor.shape[0]
-    
+
     @property
     def device(self):
         return self.tensor.device
-    
+
     @property
     def dims(self):
         return self.tensor.ndim - 2
-    
+
     @property
     def shape(self):
         return self.tensor.shape
-    
-    
+
+
     def write_image(self, filenames: Union[str, List[str]], permitted_ext: List[str] = PERMITTED_ANTS_WARP_EXT):
         """
         Save tensor elements to disk as SimpleITK images.
-        
+
         For each image in the batch:
         - If multi-channel, the channel dimension is permuted to the end
         - If single-channel, the channel dimension is squeezed
         - Metadata is copied from the corresponding BatchedImages itk_image
-        
+
         Args:
             filenames (str or List[str]): A single filename or a list of filenames.
-                - If one filename is provided for multiple images, they will be saved as 
+                - If one filename is provided for multiple images, they will be saved as
                   filename_img0.ext, filename_img1.ext, etc.
                 - If the number of filenames equals the number of images, they are mapped one-to-one.
                 - Otherwise, an error is raised.
-        
+
         Raises:
             ValueError: If the number of filenames doesn't match the number of images and is not 1.
         """
         batch_size = self.tensor.shape[0]
-        
+
         # Convert single filename to list
         if isinstance(filenames, str):
             filenames = [filenames]
-        
+
         # Check if number of filenames matches number of images
         check_and_raise_cond(len(filenames)==1 or len(filenames)==batch_size, "Number of filenames must match the number of images or be 1", ValueError)
         filenames = augment_filenames(filenames, batch_size, permitted_ext)
-        
+
         # Process each image in the batch
         for i in range(batch_size):
             # Get the corresponding tensor
             img_tensor = self.tensor[i]
-            
+
             # Check if multi-channel (channel dimension is at index 0 after batch dimension)
             channels = img_tensor.shape[0]
             isVector = channels > 1
@@ -577,13 +623,13 @@ class FakeBatchedImages:
             else:
                 # If single channel, squeeze the channel dimension
                 img_tensor = img_tensor.squeeze(0)
-            
+
             # Convert tensor to numpy array
             np_array = img_tensor.detach().cpu().numpy()
-            
+
             # Create SimpleITK image
             itk_image = sitk.GetImageFromArray(np_array, isVector=isVector)
-            
+
             # Get metadata from corresponding BatchedImages object
             if hasattr(self.batched_images, 'images') and i < len(self.batched_images.images):
                 src_itk = self.batched_images.images[i].itk_image
@@ -592,7 +638,7 @@ class FakeBatchedImages:
                 itk_image.SetOrigin(src_itk.GetOrigin())
             else:
                 raise ValueError("No corresponding BatchedImages object found for image {}".format(i))
-            
+
             save_filename = filenames[i]
             # Save the image (this needs to be thread safe)
             with get_lock():
@@ -611,7 +657,7 @@ if __name__ == '__main__':
     details = get_tensor_memory_details()
     for tensor, size, _, _ in details:
         print(tensor.shape, size)
-    
+
     # torch.cuda.memory._dump_snapshot("image.pkl")
     # print(image.array.shape, image.array.min(), image.array.max())
     # # get label

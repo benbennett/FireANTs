@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
 # 
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
@@ -24,6 +24,7 @@ from fireants.registration.distributed.utils import add_distributed_padding, cro
 import logging
 logger = logging.getLogger(__name__)
 from fireants.registration.distributed import parallel_state
+from typing import Optional
 
 import os
 import logging
@@ -78,6 +79,7 @@ class WarpAdam:
                  freeform=False,
                  offload=False,   # try offloading to CPU
                  reset=False,
+                 reset_step=True,
                  # distributed params
                  rank: int = 0, 
                  dim_to_shard: int = 0,
@@ -105,6 +107,7 @@ class WarpAdam:
         self.weight_decay = weight_decay
         self.multiply_jacobian = multiply_jacobian
         self.reset = reset
+        self.reset_step = reset_step
         self.scaledown = scaledown   # if true, the scale the gradient even if norm is below 1
         # offload params
         self.device = warp.device
@@ -174,6 +177,8 @@ class WarpAdam:
                 self.exp_avg_sq = self.exp_avg_sq.to('cpu')
 
         self.half_resolution = 1.0/(max(warp.shape[1:-1]) - 1)
+        if self.reset_step:
+            self.step_t = 0
         self.initialize_grid(size, grid_copy=grid_copy)
         # print(self.warp.shape, warpinv)
     
@@ -205,7 +210,7 @@ class WarpAdam:
                 ujac = torch.einsum('bxhwdp,bhwdp->bhwdx', jac, u)
             return ujac
     
-    def step(self):
+    def step(self, loss: Optional[torch.Tensor] = None):
         ''' check for momentum, and other things '''
         grad = self.warp.grad.data
         if self.multiply_jacobian:

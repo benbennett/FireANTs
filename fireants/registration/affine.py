@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
 # 
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
@@ -63,7 +63,9 @@ class AffineRegistration(AbstractRegistration):
         cc_kernel_size (int, optional): Kernel size for CC loss. Defaults to 3.
         tolerance (float, optional): Convergence tolerance. Defaults to 1e-6.
         max_tolerance_iters (int, optional): Max iterations for convergence. Defaults to 10.
-        init_rigid (Optional[torch.Tensor], optional): Initial affine matrix. Defaults to None.
+        init_rigid (Optional[Union[torch.Tensor, str]], optional): Initial affine matrix. If a tensor, used
+            directly; if the string "cof", use identity for the linear part and translation c_m - c_f
+            (center of moving minus center of fixed). Defaults to None.
         custom_loss (nn.Module, optional): Custom loss module. Defaults to None.
         blur (bool, optional): Whether to blur images during downsampling. Defaults to True.
         around_center (bool, optional): Whether to apply affine around the center of the image. Defaults to True.
@@ -84,7 +86,7 @@ class AffineRegistration(AbstractRegistration):
                 cc_kernel_size: int = 3,
                 tolerance: float = 1e-6, max_tolerance_iters: int = 10, 
                 around_center: bool = True,
-                init_rigid: Optional[torch.Tensor] = None,
+                init_rigid: Optional[Union[torch.Tensor, str]] = None,
                 custom_loss: nn.Module = None,
                 blur: bool = True,
                 **kwargs
@@ -98,13 +100,23 @@ class AffineRegistration(AbstractRegistration):
         self.blur = blur
         # first three params are so(n) variables, last three are translation
         if init_rigid is not None:
-            B, D1, D2 = init_rigid.shape
-            if D1 == dims and D2 == dims+1:
-                affine = init_rigid
-            elif D1 == dims+1 and D2 == dims+1:
-                affine = init_rigid[:, :-1, :] + 0
+            if isinstance(init_rigid, str):
+                if init_rigid == "cof":
+                    # Identity for affine part, translation = c_m - c_f (same as rigid/moments cof)
+                    affine = torch.eye(dims, dims + 1).unsqueeze(0).repeat(self.opt_size, 1, 1).to(device)
+                    c_f = self.fixed_images.get_torch2phy()[:, :dims, -1].detach().contiguous()
+                    c_m = self.moving_images.get_torch2phy()[:, :dims, -1].detach().contiguous()
+                    affine[:, :dims, -1] = (c_m - c_f).to(device)
+                else:
+                    raise ValueError(f"init_rigid must be a tensor or 'cof', got {init_rigid}")
             else:
-                raise ValueError(f"init_rigid must have shape [N, {dims}, {dims+1}] or [N, {dims+1}, {dims+1}], got {init_rigid.shape}")
+                B, D1, D2 = init_rigid.shape
+                if D1 == dims and D2 == dims+1:
+                    affine = init_rigid
+                elif D1 == dims+1 and D2 == dims+1:
+                    affine = init_rigid[:, :-1, :] + 0
+                else:
+                    raise ValueError(f"init_rigid must have shape [N, {dims}, {dims+1}] or [N, {dims+1}, {dims+1}], got {init_rigid.shape}")
         else:
             affine = torch.eye(dims, dims+1).unsqueeze(0).repeat(self.opt_size, 1, 1).to(device)  # [N, D, D+1]
         
@@ -235,18 +247,39 @@ class AffineRegistration(AbstractRegistration):
         for scale, iters in zip(self.scales, self.iterations):
             self.convergence_monitor.reset()
             prev_loss = np.inf
+            # notify loss function of scale change if it supports it
+            if hasattr(self.loss_fn, 'set_current_scale_and_iterations'):
+                self.loss_fn.set_current_scale_and_iterations(scale, iters)
             # downsample fixed array and retrieve coords
             size_down = [max(int(s / scale), MIN_IMG_SIZE) for s in fixed_size]
             mov_size_down = [max(int(s / scale), MIN_IMG_SIZE) for s in moving_arrays.shape[2:]]
             # downsample
             if self.blur and scale > 1:
-                sigmas = 0.5 * torch.tensor([sz/szdown for sz, szdown in zip(fixed_size, size_down)], device=fixed_arrays.device, dtype=moving_arrays.dtype)
+                sigmas = 0.5 * torch.tensor(
+                    [sz / szdown for sz, szdown in zip(fixed_size, size_down)],
+                    device=fixed_arrays.device,
+                    dtype=moving_arrays.dtype,
+                )
                 gaussians = [gaussian_1d(s, truncated=2) for s in sigmas]
-                fixed_image_down = downsample(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, gaussians=gaussians)
-                moving_image_blur = downsample(moving_arrays, size=mov_size_down, mode=self.moving_images.interpolate_mode, gaussians=gaussians)
+                fixed_image_down = self._downsample_image_and_mask(
+                    fixed_arrays,
+                    size=size_down,
+                    mode=self.fixed_images.interpolate_mode,
+                    gaussians=gaussians,
+                    align_corners=True,
+                )
+                moving_image_blur = self._downsample_image_and_mask(
+                    moving_arrays,
+                    size=mov_size_down,
+                    mode=self.moving_images.interpolate_mode,
+                    gaussians=gaussians,
+                    align_corners=True,
+                )
             else:
                 if scale > 1:
-                    fixed_image_down = F.interpolate(fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True)
+                    fixed_image_down = F.interpolate(
+                        fixed_arrays, size=size_down, mode=self.fixed_images.interpolate_mode, align_corners=True
+                    )
                 else:
                     fixed_image_down = fixed_arrays
                 moving_image_blur = moving_arrays

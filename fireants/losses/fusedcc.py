@@ -1,5 +1,5 @@
-# Copyright (c) 2025 Rohit Jena. All rights reserved.
-# 
+# Copyright (c) 2026 Rohit Jena. All rights reserved.
+#
 # This file is part of FireANTs, distributed under the terms of
 # the FireANTs License version 1.0. A copy of the license can be found
 # in the LICENSE file at the root of this repository.
@@ -7,10 +7,10 @@
 # IMPORTANT: This code is part of FireANTs and its use, reproduction, or
 # distribution must comply with the full license terms, including:
 # - Maintaining all copyright notices and bibliography references
-# - Using only approved (re)-distribution channels 
+# - Using only approved (re)-distribution channels
 # - Proper attribution in derivative works
 #
-# For full license details, see: https://github.com/rohitrango/FireANTs/blob/main/LICENSE 
+# For full license details, see: https://github.com/rohitrango/FireANTs/blob/main/LICENSE
 
 
 '''
@@ -27,9 +27,11 @@ from fireants.types import ItemOrList
 import fireants_fused_ops as ffo
 from fireants.losses.cc import LocalNormalizedCrossCorrelationLoss, gaussian_1d
 from fireants.tests.cc_mem_test import fast_lncc
+from fireants.losses.maskedutils import POSSIBLE_MASKED_MODES, DEFAULT_MASK_MODE, get_tensors_and_mask, mask_loss_function
 import itertools
 import logging
 logger = logging.getLogger(__name__)
+
 
 MAX_INT32_NUMEL = 2**31 - 1
 
@@ -52,7 +54,7 @@ class FusedNCC3d(torch.autograd.Function):
         # interm[:, 3*C:4*C, :, :, :] = target_img * target_img
         # interm[:, 4*C:, :, :, :] = input_img * target_img  # [B, 5C, H, W, D]
         ffo.create_intermediates(input_img, target_img, interm)
-        # compute kernel 
+        # compute kernel
         kernel_vol = kernel_size ** 3
 
         if use_separable:
@@ -88,12 +90,12 @@ class FusedNCC3d(torch.autograd.Function):
         ctx.save_for_backward(interm, input_img, target_img, out)
         ctx.kernel_size = kernel_size
         ctx.nr = nr
-        ctx.dr = dr 
+        ctx.dr = dr
         ctx.reduction = reduction
         ctx.use_ants_gradient = use_ants_gradient
         ctx.use_separable = use_separable
         return out
-    
+
     @staticmethod
     def backward(ctx, grad_output):
         # retrieve saved tensors
@@ -109,6 +111,7 @@ class FusedNCC3d(torch.autograd.Function):
         inp_size = 5*C if not input_too_large else 1
 
         # initialize filters
+        kernel_vol = kernel_size ** 3
         if use_separable:
             filt1 = torch.ones(inp_size, 1, kernel_size, 1, 1, device=input_img.device, dtype=input_img.dtype) / kernel_size
             filt2 = torch.ones(inp_size, 1, 1, kernel_size, 1, device=input_img.device, dtype=input_img.dtype) / kernel_size
@@ -128,7 +131,7 @@ class FusedNCC3d(torch.autograd.Function):
         if target_img.requires_grad:
             grad_target_img = torch.zeros(B, C, H, W, D, device=input_img.device, dtype=input_img.dtype)
         # compute correct gradients (maybe slightly slower)
-        ffo.cc3d_bwd_modify_interm_v1(interm, input_img, target_img, grad_output, grad_input_img, grad_target_img, kernel_size, nr, dr, reduction)
+        ffo.cc3d_bwd_modify_interm_v1(interm, input_img, target_img, grad_output, grad_input_img, grad_target_img, kernel_size, kernel_vol, nr, dr, reduction)
         # convolve with average filter depending on whether grad_target_img is None
         # if using ants_gradient, the convolution is skipped (ignore interactions from other neighboring pixels)
         if not use_ants_gradient:
@@ -185,7 +188,7 @@ class FusedNCC3dGaussian(torch.autograd.Function):
         assert input_img.is_contiguous() and target_img.is_contiguous(), "input_img and target_img must be contiguous"
         interm = torch.zeros(B, 5 * C, H, W, D, device=input_img.device, dtype=input_img.dtype)
         ffo.create_intermediates(input_img, target_img, interm)
-        # compute kernel 
+        # compute kernel
         kernel_vol = kernel_size ** 3
         # get truncated to match kernel size
         truncated = (kernel_size//2 - 0.5)/sigma
@@ -228,22 +231,23 @@ class FusedNCC3dGaussian(torch.autograd.Function):
         ctx.sigma = sigma
         ctx.truncated = truncated
         ctx.nr = nr
-        ctx.dr = dr 
+        ctx.dr = dr
         ctx.reduction = reduction
         ctx.use_ants_gradient = use_ants_gradient
         ctx.use_separable = use_separable
         return out
-    
+
     @staticmethod
     def backward(ctx, grad_output):
         # retrieve saved tensors
         interm, input_img, target_img, out = ctx.saved_tensors
         kernel_size, sigma, truncated, nr, dr, reduction, use_ants_gradient, use_separable = ctx.kernel_size, ctx.sigma, ctx.truncated, ctx.nr, ctx.dr, ctx.reduction, ctx.use_ants_gradient, ctx.use_separable
         B, C, H, W, D = input_img.shape
+        kernel_vol = kernel_size ** 3
 
         input_too_large = interm.numel() >= MAX_INT32_NUMEL
         inp_size = 5*C if not input_too_large else 1
-    
+
         gauss_filt = gaussian_1d(torch.tensor(sigma, device=input_img.device, dtype=input_img.dtype), truncated=truncated, approx="sampled")  # kernel size
 
         if reduction == ffo.Reduction.MEAN:
@@ -270,7 +274,7 @@ class FusedNCC3dGaussian(torch.autograd.Function):
         if target_img.requires_grad:
             grad_target_img = torch.zeros(B, C, H, W, D, device=input_img.device, dtype=input_img.dtype)
         # compute correct gradients (maybe slightly slower)
-        ffo.cc3d_bwd_modify_interm_v1(interm, input_img, target_img, grad_output, grad_input_img, grad_target_img, kernel_size, nr, dr, reduction)
+        ffo.cc3d_bwd_modify_interm_v1(interm, input_img, target_img, grad_output, grad_input_img, grad_target_img, kernel_size, kernel_vol, nr, dr, reduction)
         # convolve with average filter depending on whether grad_target_img is None
         # if using ants_gradient, the convolution is skipped (ignore interactions from other neighboring pixels)
         if not use_ants_gradient:
@@ -319,6 +323,340 @@ class FusedNCC3dGaussian(torch.autograd.Function):
         return grad_input_img, grad_target_img, None, None, None, None, None, None, None
 
 
+class FusedNCC2d(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_img, target_img, kernel_size, nr, dr, reduction, use_ants_gradient, use_separable):
+        reduction = reduction_table[reduction.lower()]
+        B, C, H, W = input_img.shape
+        assert input_img.is_contiguous() and target_img.is_contiguous(), "input_img and target_img must be contiguous"
+        # Convert to 5D for ffo operations
+        input_img_5d = input_img[..., None]  # [B, C, H, W, 1]
+        target_img_5d = target_img[..., None]  # [B, C, H, W, 1]
+        interm = torch.zeros(B, 5 * C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        ffo.create_intermediates(input_img_5d, target_img_5d, interm)
+        # compute kernel
+        kernel_vol = kernel_size ** 2
+
+        if use_separable:
+            if interm.numel() >= MAX_INT32_NUMEL:
+                # numel is too large for group convolution, fallback to singular
+                filt1 = torch.ones(1, 1, kernel_size, 1, device=input_img.device, dtype=input_img.dtype) / kernel_size
+                filt2 = torch.ones(1, 1, 1, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_size
+                for c in range(5*C):
+                    interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                    interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                    interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                    interm[:, c:c+1, :, :, 0] = interm_2d
+            else:
+                filt1 = torch.ones(5*C, 1, kernel_size, 1, device=input_img.device, dtype=input_img.dtype) / kernel_size
+                filt2 = torch.ones(5*C, 1, 1, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_size
+                interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=interm_2d.shape[1])
+                interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=interm_2d.shape[1])
+                interm[:, :, :, :, 0] = interm_2d
+        else:
+            if interm.numel() >= MAX_INT32_NUMEL:
+                # numel is too large for group convolution, fallback to singular
+                avg_filt = torch.ones(1, 1, kernel_size, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_vol
+                padding = (kernel_size - 1) // 2
+                for c in range(5*C):
+                    interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                    interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+            else:
+                avg_filt = torch.ones(5*C, 1, kernel_size, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_vol
+                padding = (kernel_size - 1) // 2
+                interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                interm_2d = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=interm_2d.shape[1])
+                interm[:, :, :, :, 0] = interm_2d
+
+        out = ffo.cc3d_fwd_interm_v1(interm, int(kernel_vol), reduction, nr, dr)
+        # Squeeze the last dimension if output is 5D
+        if out.ndim == 5 and out.shape[-1] == 1:
+            out = out.squeeze(-1)
+        ctx.save_for_backward(interm, input_img, target_img, out)
+        ctx.kernel_size = kernel_size
+        ctx.nr = nr
+        ctx.dr = dr
+        ctx.reduction = reduction
+        ctx.use_ants_gradient = use_ants_gradient
+        ctx.use_separable = use_separable
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # retrieve saved tensors
+        interm, input_img, target_img, out = ctx.saved_tensors
+        kernel_size, nr, dr, reduction, use_ants_gradient, use_separable = ctx.kernel_size, ctx.nr, ctx.dr, ctx.reduction, ctx.use_ants_gradient, ctx.use_separable
+        B, C, H, W = input_img.shape
+
+        # Convert to 5D for ffo operations
+        input_img_5d = input_img[..., None]  # [B, C, H, W, 1]
+        target_img_5d = target_img[..., None]  # [B, C, H, W, 1]
+        # Handle grad_output: if 4D, add dimension; if scalar/1D, keep as is (reduction case)
+        if grad_output.ndim == 4:
+            grad_output_5d = grad_output[..., None]  # [B, C, H, W, 1]
+        else:
+            grad_output_5d = grad_output  # scalar or 1D for reduction cases
+
+        input_too_large = interm.numel() >= MAX_INT32_NUMEL
+        inp_size = 5*C if not input_too_large else 1
+
+        # initialize filters
+        kernel_vol = kernel_size ** 2
+        if use_separable:
+            filt1 = torch.ones(inp_size, 1, kernel_size, 1, device=input_img.device, dtype=input_img.dtype) / kernel_size
+            filt2 = torch.ones(inp_size, 1, 1, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_size
+        else:
+            avg_filt = torch.ones(inp_size, 1, kernel_size, kernel_size, device=input_img.device, dtype=input_img.dtype) / kernel_vol
+            padding = (kernel_size - 1) // 2
+
+        # initialize gradients
+        grad_input_img = None
+        grad_target_img = None
+        # if backward is called, first tensor will always require grad
+        # second may or may not require grad
+        if input_img.requires_grad:
+            grad_input_img_5d = torch.zeros(B, C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        if target_img.requires_grad:
+            grad_target_img_5d = torch.zeros(B, C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        # compute correct gradients (maybe slightly slower)
+        ffo.cc3d_bwd_modify_interm_v1(interm, input_img_5d, target_img_5d, grad_output_5d, grad_input_img_5d if input_img.requires_grad else None, grad_target_img_5d if target_img.requires_grad else None, kernel_size, kernel_vol, nr, dr, reduction)
+        # convolve with average filter depending on whether grad_target_img is None
+        # if using ants_gradient, the convolution is skipped (ignore interactions from other neighboring pixels)
+        if not use_ants_gradient:
+            padding = (kernel_size - 1) // 2
+            if target_img.requires_grad:
+                # convolve with "one" filter depending on whether separable or not
+                if use_separable:
+                    if input_too_large:
+                        for c in range(5*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                            interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                            interm[:, c:c+1, :, :, 0] = interm_2d
+                    else:
+                        interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=interm_2d.shape[1])
+                        interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=interm_2d.shape[1])
+                        interm[:, :, :, :, 0] = interm_2d
+                else:
+                    if input_too_large:
+                        for c in range(5*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+                    else:
+                        interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=interm_2d.shape[1])
+                        interm[:, :, :, :, 0] = interm_2d
+            else:
+                if use_separable:
+                    if input_too_large:
+                        for c in range(3*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                            interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                            interm[:, c:c+1, :, :, 0] = interm_2d
+                    else:
+                        filt1_3c = filt1[:3*C]
+                        filt2_3c = filt2[:3*C]
+                        interm_2d = interm[:, :3*C, :, :, 0]  # [B, 3*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, filt1_3c, padding='same', stride=1, groups=3*C)
+                        interm_2d = F.conv2d(interm_2d, filt2_3c, padding='same', stride=1, groups=3*C)
+                        interm[:, :3*C, :, :, 0] = interm_2d
+                else:
+                    if input_too_large:
+                        for c in range(3*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+                    else:
+                        avg_filt_3c = avg_filt[:3*C]
+                        interm_2d = interm[:, :3*C, :, :, 0]  # [B, 3*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, avg_filt_3c, padding=padding, stride=1, groups=3*C)
+                        interm[:, :3*C, :, :, 0] = interm_2d
+        # solve for grad_input_img and grad_target_img
+        ffo.cc3d_bwd_compute_grads(interm, input_img_5d, target_img_5d, grad_input_img_5d if input_img.requires_grad else None, grad_target_img_5d if target_img.requires_grad else None)
+        # Squeeze the last dimension to convert back to 4D
+        if input_img.requires_grad:
+            grad_input_img = grad_input_img_5d.squeeze(-1)
+        if target_img.requires_grad:
+            grad_target_img = grad_target_img_5d.squeeze(-1)
+        return grad_input_img, grad_target_img, None, None, None, None, None, None
+
+
+class FusedNCC2dGaussian(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_img, target_img, kernel_size, sigma, nr, dr, reduction, use_ants_gradient, use_separable):
+        reduction = reduction_table[reduction.lower()]
+        B, C, H, W = input_img.shape
+        assert input_img.is_contiguous() and target_img.is_contiguous(), "input_img and target_img must be contiguous"
+        # Convert to 5D for ffo operations
+        input_img_5d = input_img[..., None]  # [B, C, H, W, 1]
+        target_img_5d = target_img[..., None]  # [B, C, H, W, 1]
+        interm = torch.zeros(B, 5 * C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        ffo.create_intermediates(input_img_5d, target_img_5d, interm)
+        # compute kernel
+        kernel_vol = kernel_size ** 2
+        # get truncated to match kernel size
+        truncated = (kernel_size//2 - 0.5)/sigma
+        gauss_filt = gaussian_1d(torch.tensor(sigma, device=input_img.device, dtype=input_img.dtype), truncated=truncated, approx="sampled")  # kernel size
+        assert gauss_filt.numel() == kernel_size, "kernel size does not match"
+
+        if use_separable:
+            if interm.numel() >= MAX_INT32_NUMEL:
+                # numel is too large for group convolution, fallback to singular
+                filt1 = gauss_filt[None, None, :, None]
+                filt2 = gauss_filt[None, None, None, :]
+                for c in range(5*C):
+                    interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                    interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                    interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                    interm[:, c:c+1, :, :, 0] = interm_2d
+            else:
+                filt1 = gauss_filt[None, None, :, None].expand(5*C, -1, -1, -1)
+                filt2 = gauss_filt[None, None, None, :].expand(5*C, -1, -1, -1)
+                interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=interm_2d.shape[1])
+                interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=interm_2d.shape[1])
+                interm[:, :, :, :, 0] = interm_2d
+        else:
+            if interm.numel() >= MAX_INT32_NUMEL:
+                # numel is too large for group convolution, fallback to singular
+                avg_filt = gauss_filt[None, None, :, None] * gauss_filt[None, None, None, :]
+                padding = (kernel_size - 1) // 2
+                for c in range(5*C):
+                    interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                    interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+            else:
+                avg_filt = gauss_filt[None, None, :, None] * gauss_filt[None, None, None, :]
+                avg_filt = avg_filt.expand(5*C, -1, -1, -1)
+                padding = (kernel_size - 1) // 2
+                interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                interm_2d = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=interm_2d.shape[1])
+                interm[:, :, :, :, 0] = interm_2d
+
+        out = ffo.cc3d_fwd_interm_v1(interm, int(kernel_vol), reduction, nr, dr)
+        # Squeeze the last dimension if output is 5D
+        if out.ndim == 5 and out.shape[-1] == 1:
+            out = out.squeeze(-1)
+        ctx.save_for_backward(interm, input_img, target_img, out)
+        ctx.kernel_size = kernel_size
+        ctx.sigma = sigma
+        ctx.truncated = truncated
+        ctx.nr = nr
+        ctx.dr = dr
+        ctx.reduction = reduction
+        ctx.use_ants_gradient = use_ants_gradient
+        ctx.use_separable = use_separable
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # retrieve saved tensors
+        interm, input_img, target_img, out = ctx.saved_tensors
+        kernel_size, sigma, truncated, nr, dr, reduction, use_ants_gradient, use_separable = ctx.kernel_size, ctx.sigma, ctx.truncated, ctx.nr, ctx.dr, ctx.reduction, ctx.use_ants_gradient, ctx.use_separable
+        B, C, H, W = input_img.shape
+        kernel_vol = kernel_size ** 2
+
+        # Normalize grad_output for MEAN reduction (same as 3D Gaussian version)
+        if reduction == ffo.Reduction.MEAN:
+            grad_output = grad_output / (B * C * H * W)
+
+        # Convert to 5D for ffo operations
+        input_img_5d = input_img[..., None]  # [B, C, H, W, 1]
+        target_img_5d = target_img[..., None]  # [B, C, H, W, 1]
+        # Handle grad_output: if 4D, add dimension; if scalar/1D, keep as is (reduction case)
+        if grad_output.ndim == 4:
+            grad_output_5d = grad_output[..., None]  # [B, C, H, W, 1]
+        else:
+            grad_output_5d = grad_output  # scalar or 1D for reduction cases
+
+        input_too_large = interm.numel() >= MAX_INT32_NUMEL
+        inp_size = 5*C if not input_too_large else 1
+
+        gauss_filt = gaussian_1d(torch.tensor(sigma, device=input_img.device, dtype=input_img.dtype), truncated=truncated, approx="sampled")  # kernel size
+
+        # initialize filters
+        if use_separable:
+            filt1 = gauss_filt[None, None, :, None].expand(inp_size, -1, -1, -1)
+            filt2 = gauss_filt[None, None, None, :].expand(inp_size, -1, -1, -1)
+        else:
+            avg_filt = gauss_filt[None, None, :, None] * gauss_filt[None, None, None, :]
+            avg_filt = avg_filt.expand(inp_size, -1, -1, -1)
+            padding = (kernel_size - 1) // 2
+
+        # initialize gradients
+        grad_input_img = None
+        grad_target_img = None
+        # if backward is called, first tensor will always require grad
+        # second may or may not require grad
+        if input_img.requires_grad:
+            grad_input_img_5d = torch.zeros(B, C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        if target_img.requires_grad:
+            grad_target_img_5d = torch.zeros(B, C, H, W, 1, device=input_img.device, dtype=input_img.dtype)
+        # compute correct gradients (maybe slightly slower)
+        ffo.cc3d_bwd_modify_interm_v1(interm, input_img_5d, target_img_5d, grad_output_5d, grad_input_img_5d if input_img.requires_grad else None, grad_target_img_5d if target_img.requires_grad else None, kernel_size, kernel_vol, nr, dr, reduction)
+        # convolve with average filter depending on whether grad_target_img is None
+        # if using ants_gradient, the convolution is skipped (ignore interactions from other neighboring pixels)
+        if not use_ants_gradient:
+            padding = (kernel_size - 1) // 2
+            if target_img.requires_grad:
+                # convolve with "one" filter depending on whether separable or not
+                if use_separable:
+                    if input_too_large:
+                        for c in range(5*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                            interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                            interm[:, c:c+1, :, :, 0] = interm_2d
+                    else:
+                        interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=interm_2d.shape[1])
+                        interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=interm_2d.shape[1])
+                        interm[:, :, :, :, 0] = interm_2d
+                else:
+                    if input_too_large:
+                        for c in range(5*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+                    else:
+                        interm_2d = interm[:, :, :, :, 0]  # [B, 5*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=interm_2d.shape[1])
+                        interm[:, :, :, :, 0] = interm_2d
+            else:
+                if use_separable:
+                    if input_too_large:
+                        for c in range(3*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm_2d = F.conv2d(interm_2d, filt1, padding='same', stride=1, groups=1)
+                            interm_2d = F.conv2d(interm_2d, filt2, padding='same', stride=1, groups=1)
+                            interm[:, c:c+1, :, :, 0] = interm_2d
+                    else:
+                        filt1_3c = filt1[:3*C]
+                        filt2_3c = filt2[:3*C]
+                        interm_2d = interm[:, :3*C, :, :, 0]  # [B, 3*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, filt1_3c, padding='same', stride=1, groups=3*C)
+                        interm_2d = F.conv2d(interm_2d, filt2_3c, padding='same', stride=1, groups=3*C)
+                        interm[:, :3*C, :, :, 0] = interm_2d
+                else:
+                    if input_too_large:
+                        for c in range(3*C):
+                            interm_2d = interm[:, c:c+1, :, :, 0]  # [B, 1, H, W]
+                            interm[:, c:c+1, :, :, 0] = F.conv2d(interm_2d, avg_filt, padding=padding, stride=1, groups=1)
+                    else:
+                        avg_filt_3c = avg_filt[:3*C]
+                        interm_2d = interm[:, :3*C, :, :, 0]  # [B, 3*C, H, W]
+                        interm_2d = F.conv2d(interm_2d, avg_filt_3c, padding=padding, stride=1, groups=3*C)
+                        interm[:, :3*C, :, :, 0] = interm_2d
+        # solve for grad_input_img and grad_target_img
+        ffo.cc3d_bwd_compute_grads(interm, input_img_5d, target_img_5d, grad_input_img_5d if input_img.requires_grad else None, grad_target_img_5d if target_img.requires_grad else None)
+        # Squeeze the last dimension to convert back to 4D
+        if input_img.requires_grad:
+            grad_input_img = grad_input_img_5d.squeeze(-1)
+        if target_img.requires_grad:
+            grad_target_img = grad_target_img_5d.squeeze(-1)
+        return grad_input_img, grad_target_img, None, None, None, None, None, None, None
+
+
 class FusedLocalNormalizedCrossCorrelationLoss(nn.Module):
     """
     Local squared zero-normalized cross-correlation.
@@ -339,6 +677,9 @@ class FusedLocalNormalizedCrossCorrelationLoss(nn.Module):
         use_separable: bool = True,
         kernel_type: str = "rectangular",
         sigma: float = 1.5,
+        # masked params
+        masked: bool = False,
+        mask_mode: str = DEFAULT_MASK_MODE,
     ) -> None:
         """
         Args:
@@ -354,8 +695,10 @@ class FusedLocalNormalizedCrossCorrelationLoss(nn.Module):
         """
         super().__init__()
         self.ndim = spatial_dims
-        if self.ndim != 3:
-            raise ValueError(f"Unsupported ndim: {self.ndim}-d, only 3-d inputs are supported")
+        if self.ndim not in {2, 3}:
+            raise ValueError(f"Unsupported ndim: {self.ndim}-d, only 2-d and 3-d inputs are supported")
+        # if self.ndim != 3:
+        #     raise ValueError(f"Unsupported ndim: {self.ndim}-d, only 3-d inputs are supported")
         self.reduction = reduction
         # gaussian kernel parameters
         self.kernel_type = kernel_type
@@ -368,37 +711,59 @@ class FusedLocalNormalizedCrossCorrelationLoss(nn.Module):
             raise ValueError(f"kernel_size must be odd, got {self.kernel_size}")
 
         # _kernel = look_up_option(kernel_type, kernel_dict)
-        kernel_vol = self.kernel_size ** self.ndim 
+        kernel_vol = self.kernel_size ** self.ndim
         self.smooth_nr = float(smooth_nr) * kernel_vol
         self.smooth_dr = float(smooth_dr) * kernel_vol
         self.use_ants_gradient = use_ants_gradient
         self.use_separable = use_separable
-    
+
+        # masked params
+        self.masked = masked
+        self.mask_mode = mask_mode
+        self.masked_reduction = reduction
+        assert mask_mode in POSSIBLE_MASKED_MODES
+        # turn off reduction for our own thing
+        if self.masked:
+            self.reduction = 'none'
+
     def set_scales(self, scales):
         ''' function is called at initialization of abstract registration '''
         self.scales = scales
         if self.kernel_size_list:
             assert len(self.kernel_size_list) == len(self.scales), "kernel_size must be a list of the same length as scales"
-    
+
     def set_iterations(self, iterations):
         ''' function is called at initialization of abstract registration '''
         self.iterations = iterations
-    
+
     def set_current_scale_and_iterations(self, scale, iters):
+        logger.info(f"setting current scale and iterations to {scale} and {iters}")
         if self.kernel_size_list:
             idx = self.scales.index(scale)
             self.kernel_size = self.kernel_size_list[idx]
-    
+
     def get_image_padding(self) -> int:
         return (self.kernel_size - 1) // 2
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,) -> torch.Tensor:
         """
         Args:
             pred: the shape should be BNH[WD].
             target: the shape should be BNH[WD].
-        Raises:
-            ValueError: When ``self.reduction`` is not one of ["mean", "sum", "none"].
+        """
+        if not self.masked:
+            return self.forward_util(pred, target)
+        # masked mode
+        pred, target, mask = get_tensors_and_mask(pred, target, self.mask_mode)
+        loss_tensor = self.forward_util(pred, target)
+        loss = mask_loss_function(loss_tensor, mask, self.masked_reduction)
+        return loss
+
+    def forward_util(self, pred: torch.Tensor, target: torch.Tensor,) -> torch.Tensor:
+        """
+        Args:
+            pred: the shape should be BNH[WD].
+            target: the shape should be BNH[WD].
         """
         if pred.ndim - 2 != self.ndim:
             raise ValueError(f"expecting pred with {self.ndim} spatial dimensions, got pred of shape {pred.shape}")
@@ -406,16 +771,33 @@ class FusedLocalNormalizedCrossCorrelationLoss(nn.Module):
             raise ValueError(f"ground truth has differing shape ({target.shape}) from pred ({pred.shape})")
         # check if both pred and target require grad
         pgrad, tgrad = pred.requires_grad, target.requires_grad
-        # if both or neither require grad, dont shuffle the order 
+        # if both or neither require grad, dont shuffle the order
         # the first tensor will always require grad (or neither does)
         if tgrad and not pgrad:
             pred, target = target, pred
-        
+
         pred, target = pred.contiguous(), target.contiguous()
-        
-        if self.kernel_type == "gaussian":
-            return -FusedNCC3dGaussian.apply(pred, target, self.kernel_size, self.sigma, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
-        elif self.kernel_type == "rectangular":
-            return -FusedNCC3d.apply(pred, target, self.kernel_size, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
+
+        if self.ndim == 2:
+            # 2D case
+            if self.kernel_type == "gaussian":
+                val =  -FusedNCC2dGaussian.apply(pred, target, self.kernel_size, self.sigma, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
+            elif self.kernel_type == "rectangular":
+                val = -FusedNCC2d.apply(pred, target, self.kernel_size, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
+            else:
+                raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
+        elif self.ndim == 3:
+            # 3D case
+            if self.kernel_type == "gaussian":
+                val = -FusedNCC3dGaussian.apply(pred, target, self.kernel_size, self.sigma, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
+            elif self.kernel_type == "rectangular":
+                val = -FusedNCC3d.apply(pred, target, self.kernel_size, self.smooth_nr, self.smooth_dr, self.reduction, self.use_ants_gradient, self.use_separable)
+            else:
+                raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
         else:
-            raise ValueError(f"Unsupported kernel type: {self.kernel_type}")
+            raise ValueError(f"Unsupported spatial_dims: {self.ndim}")
+        
+        return val
+            
+
+        
