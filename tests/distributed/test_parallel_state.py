@@ -12,6 +12,7 @@ from fireants.registration.distributed.parallel_state import (
     get_device,
     get_grid_parallel_size,
     get_data_parallel_size,
+    get_default_backend,
 )
 
 
@@ -36,7 +37,7 @@ def distributed_env():
 @pytest.fixture(scope="module")
 def parallel_setup(distributed_env):
     """Initialize parallel state for testing. Using module scope to initialize only once."""
-    initialize_parallel_state(grid_parallel_size=2, data_parallel_size=2, backend='nccl', wait=2)
+    initialize_parallel_state(grid_parallel_size=2, data_parallel_size=2, backend=get_default_backend(), wait=2)
     yield
     cleanup_parallel_state(wait=10)
 

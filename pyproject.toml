@@ -31,3 +31,9 @@ exclude = ["docker*", "notepad*", "fused_ops*", "tutorials*"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["fireants", "cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+log_cli = true
+log_cli_level = "INFO"
