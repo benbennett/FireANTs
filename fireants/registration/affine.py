@@ -179,7 +179,8 @@ class AffineRegistration(AbstractRegistration):
             t = affine[:, :self.dims, -1] + 0
             t = t + self.center - (A @ self.center[..., None]).squeeze(-1)
             affine = torch.cat([A, t[..., None]], dim=-1)
-        return torch.cat([affine, self.row], dim=1).contiguous() if homogenous else affine.contiguous()
+        affine = torch.cat([affine, self.row], dim=1).contiguous()
+        return affine if homogenous else affine[:, :-1, :].contiguous()
 
     def get_warp_parameters(self, fixed_images: Union[BatchedImages, FakeBatchedImages], moving_images: Union[BatchedImages, FakeBatchedImages], shape=None):
         """Get transformed coordinates for warping the moving image.

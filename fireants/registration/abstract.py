@@ -109,6 +109,7 @@ class AbstractRegistration(ABC):
         # check for fixed and moving image sizes
         self.fixed_images = fixed_images
         self.moving_images = moving_images
+        self.dims = fixed_images.dims
         # assert (self.fixed_images.size() == self.moving_images.size()), "Number of fixed and moving images must match"
 
         # check if sizes are broadcastable

@@ -104,7 +104,7 @@ Shrink factors for multi-resolution optimization. Must be specified once per tra
 
 **`--initial-moving-transform [fixed,moving,type]`**
 
-Initial transform to align images before registration using moment matching:
+Initial transform to align images before registration using moment matching, or an ANTs-compatible transform file:
 
 - `1`: Match by center of mass with rotation (1st order moments)
 - `2`: Match by principal axes with rotation (2nd order moments)  
@@ -113,6 +113,12 @@ Initial transform to align images before registration using moment matching:
 
 ```bash
 --initial-moving-transform [fixed.nii.gz,moving.nii.gz,2]
+```
+
+You can also pass a transform file (`.mat`, `.txt`, or `.h5`) to initialize the first stage:
+
+```bash
+--initial-moving-transform initial0GenericAffine.mat
 ```
 
 **`--winsorize-image-intensities [lower,upper]`**

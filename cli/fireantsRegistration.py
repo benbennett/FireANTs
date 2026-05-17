@@ -9,7 +9,8 @@ import torch
 import logging
 from typing import List, Optional, Union, Tuple
 
-from fireants.utils.globals import PERMITTED_ANTS_WARP_EXT
+import SimpleITK as sitk
+from fireants.utils.globals import PERMITTED_ANTS_TRANSFORM_EXT, PERMITTED_ANTS_WARP_EXT
 from fireants.io.image import Image, BatchedImages, FakeBatchedImages
 from fireants.registration.rigid import RigidRegistration
 from fireants.registration.affine import AffineRegistration
@@ -55,7 +56,7 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument('--winsorize-image-intensities', type=str, default=None,
                       help='Winsorize image intensities [lower,upper]')
     parser.add_argument('--initial-moving-transform', type=str,
-                      help='Initial transform [fixed,moving,type] or transform file')
+                      help='Initial transform [fixed,moving,type] or transform file (.mat/.txt/.h5)')
     # these are all the rigid/affine/deformable params
     parser.add_argument('--transform', type=str, action='append', required=True,
                       help='Transform type and parameters [type,params]. Can be specified multiple times.')
@@ -141,6 +142,14 @@ def parse_moment_transform(transform_type: str) -> Tuple[bool, str]:
         return 2, 'both'
     else:
         raise ValueError(f"Unsupported moment transform type: {transform_type}")
+
+def _is_transform_file(arg: str) -> bool:
+    if not arg:
+        return False
+    cleaned = arg.strip()
+    if cleaned.startswith('[') and cleaned.endswith(']'):
+        return False
+    return any(cleaned.endswith(ext) for ext in PERMITTED_ANTS_TRANSFORM_EXT) or Path(cleaned).exists()
 
 def parse_transform(transform_str: str, args: argparse.Namespace) -> Tuple[str, List[float]]:
     """Parse transform string like 'Rigid[0.1]' or 'SyN[0.1,3,0]'."""
@@ -303,6 +312,31 @@ def load_image(path: str, is_mask: bool = False, device: str = 'cuda:0') -> Imag
         logger.error(f"Error loading image {path}: {e}")
         sys.exit(1)
 
+def load_image_with_transform(
+    fixed_path: str,
+    moving_path: str,
+    transform_path: str,
+    is_mask: bool,
+    device: str,
+) -> Image:
+    try:
+        fixed_itk = sitk.ReadImage(fixed_path)
+        moving_itk = sitk.ReadImage(moving_path)
+        transform = sitk.ReadTransform(transform_path)
+        interpolator = sitk.sitkNearestNeighbor if is_mask else sitk.sitkLinear
+        moved_itk = sitk.Resample(
+            moving_itk,
+            fixed_itk,
+            transform,
+            interpolator,
+            0.0,
+            moving_itk.GetPixelID(),
+        )
+        return Image(moved_itk, is_segmentation=is_mask, device=device)
+    except Exception as e:
+        logger.error(f"Error applying transform {transform_path}: {e}")
+        sys.exit(1)
+
 def show_help(args: argparse.Namespace):
     ''' show a verbose help message '''
     help_text = """
@@ -345,12 +379,13 @@ Required Arguments:
 
 Optional Arguments:
 -----------------
---initial-moving-transform [fixed,moving,type]
-    Initial transform to align images before registration.
+--initial-moving-transform [fixed,moving,type] or transform file
+    Initial transform to align images before registration or an ANTs-compatible transform file.
     type can be:
     - 1: match by center of mass
     - 2: match by mid-point
     - 3: match by point of origin
+    Transform files must end in .mat, .txt, or .h5.
 
 --winsorize-image-intensities [lower,upper]
     Clip image intensities to specified quantiles [0,1] or percentiles [0,100]
@@ -473,32 +508,36 @@ def main():
 
     # Find an initial transform if provided
     moments_reg = None
+    initial_transform_file = None
     if args.initial_moving_transform:
-        fixed_image, moving_image, transform_type = args.initial_moving_transform.replace("[", "").replace("]", "").split(',')
-        fixed_image = load_image(fixed_image, device=args.device)
-        moving_image = load_image(moving_image, device=args.device)
-        fixed_image, moving_image = preprocess_images(fixed_image, moving_image, args.normalize_image_intensities, args.winsorize_image_intensities)
-        # apply masks if provided
-        if fixed_mask is not None:
-            fixed_image.array = fixed_image.array * fixed_mask.array
-            moving_image.array = moving_image.array * moving_mask.array
-        # initialize the batch
-        fixed_batch = BatchedImages([fixed_image])
-        moving_batch = BatchedImages([moving_image])
-        # initialize the transform type
-        moments, ori = parse_moment_transform(transform_type)
-        # run moment matching
-        moments_reg = MomentsRegistration(
-            scale=1,
-            fixed_images=fixed_batch,
-            moving_images=moving_batch,
-            moments=moments,
-            orientation=ori
-        )
-        moments_reg.optimize()
-        # if no other transforms are provided, this is the final transform, save
-        del fixed_batch, moving_batch
-        del fixed_image, moving_image
+        if _is_transform_file(args.initial_moving_transform):
+            initial_transform_file = args.initial_moving_transform
+        else:
+            fixed_image, moving_image, transform_type = args.initial_moving_transform.replace("[", "").replace("]", "").split(',')
+            fixed_image = load_image(fixed_image, device=args.device)
+            moving_image = load_image(moving_image, device=args.device)
+            fixed_image, moving_image = preprocess_images(fixed_image, moving_image, args.normalize_image_intensities, args.winsorize_image_intensities)
+            # apply masks if provided
+            if fixed_mask is not None:
+                fixed_image.array = fixed_image.array * fixed_mask.array
+                moving_image.array = moving_image.array * moving_mask.array
+            # initialize the batch
+            fixed_batch = BatchedImages([fixed_image])
+            moving_batch = BatchedImages([moving_image])
+            # initialize the transform type
+            moments, ori = parse_moment_transform(transform_type)
+            # run moment matching
+            moments_reg = MomentsRegistration(
+                scale=1,
+                fixed_images=fixed_batch,
+                moving_images=moving_batch,
+                moments=moments,
+                orientation=ori
+            )
+            moments_reg.optimize()
+            # if no other transforms are provided, this is the final transform, save
+            del fixed_batch, moving_batch
+            del fixed_image, moving_image
 
     # initialize previous transform
     prev_transform = moments_reg
@@ -517,12 +556,31 @@ def main():
 
         # load images
         fixed_image = load_image(fixed_path, device=args.device)
-        moving_image = load_image(moving_path, device=args.device)
+        if initial_transform_file is not None:
+            moving_image = load_image_with_transform(
+                fixed_path,
+                moving_path,
+                initial_transform_file,
+                is_mask=False,
+                device=args.device,
+            )
+        else:
+            moving_image = load_image(moving_path, device=args.device)
         fixed_image, moving_image = preprocess_images(fixed_image, moving_image, args.normalize_image_intensities, args.winsorize_image_intensities)
         # apply masks if provided
         if fixed_mask is not None:
+            if initial_transform_file is not None:
+                moving_mask_stage = load_image_with_transform(
+                    fixed_path,
+                    moving_mask_path,
+                    initial_transform_file,
+                    is_mask=True,
+                    device=args.device,
+                )
+            else:
+                moving_mask_stage = moving_mask
             fixed_image.array = fixed_image.array * fixed_mask.array
-            moving_image.array = moving_image.array * moving_mask.array
+            moving_image.array = moving_image.array * moving_mask_stage.array
         # initialize the batch
         fixed_batch = BatchedImages([fixed_image])
         moving_batch = BatchedImages([moving_image])
@@ -536,7 +594,6 @@ def main():
         merged_params = {**prev_transform_params, **transform_params, **metric_params}
         merged_params['tolerance'] = tolerance
         merged_params['max_tolerance_iters'] = window
-
         # Initialize registration based on transform type
         if transform_type == 'Rigid':
             reg = RigidRegistration(
@@ -632,4 +689,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
